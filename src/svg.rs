@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::ops::Deref;
 use std::path::PathBuf;
 
 use bevy::{
@@ -90,26 +92,69 @@ impl Svg {
         let view_box = tree.root().layer_bounding_box();
         let size = tree.size();
         let mut descriptors = Vec::new();
+        let transform = tree.root().transform();
 
-        for node in tree.root().children() {
+        struct NodeContext<'a> {
+            node: &'a usvg::Node,
+            transform: usvg::Transform,
+        }
+
+        let mut node_stack = tree
+            .root()
+            .children()
+            .into_iter()
+            .map(|node| NodeContext {
+                node,
+                transform,
+            })
+            .collect::<VecDeque<_>>();
+
+        while let Some(NodeContext { node, transform }) = node_stack.pop_front() {
             match node {
+                usvg::Node::Group(ref group) => {
+                    let transform = transform.pre_concat(group.transform());
+                    for node in group.children() {
+                        node_stack.push_back(NodeContext {
+                            node,
+                            transform,
+                        });
+                    }
+                }
                 usvg::Node::Path(ref path) => {
+                    if !path.is_visible() {
+                        continue
+                    }
                     let abs_transform = node.abs_transform().convert();
 
                     if let Some(fill) = &path.fill() {
-                        let color = match fill.paint() {
-                            usvg::Paint::Color(c) => {
-                                Color::srgba_u8(c.red, c.green, c.blue, fill.opacity().to_u8())
-                            }
-                            _ => Color::default(),
-                        };
+                        // from resvg render logic
+                        if path.data().bounds().width() == 0.0 || path.data().bounds().height() == 0.0 {
+                            // Horizontal and vertical lines cannot be filled. Skip.
+                        } else {
+                            let color = match fill.paint() {
+                                usvg::Paint::Color(c) => {
+                                    Color::srgba_u8(c.red, c.green, c.blue, fill.opacity().to_u8())
+                                }
+                                usvg::Paint::LinearGradient(g) => {
+                                    // TODO: implement
+                                    // just taking the average between the first and last stop so we get something to render
+                                    crate::util::paint::avg_gradient(g.deref().deref())
+                                }
+                                usvg::Paint::RadialGradient(g) => {
+                                    // TODO: implement
+                                    // just taking the average between the first and last stop so we get something to render
+                                    crate::util::paint::avg_gradient(g.deref().deref())
+                                }
+                                _ => Color::NONE,
+                            };
 
-                        descriptors.alloc().init(PathDescriptor {
-                            segments: path.convert().collect(),
-                            abs_transform,
-                            color,
-                            draw_type: DrawType::Fill,
-                        });
+                            descriptors.alloc().init(PathDescriptor {
+                                segments: path.convert().collect(),
+                                abs_transform,
+                                color,
+                                draw_type: DrawType::Fill,
+                            });
+                        }
                     }
 
                     if let Some(stroke) = &path.stroke() {
@@ -299,7 +344,7 @@ impl Convert<(Color, DrawType)> for &usvg::Stroke {
             usvg::Paint::Color(c) => Color::srgba_u8(c.red, c.green, c.blue, self.opacity().to_u8()),
             usvg::Paint::LinearGradient(_)
             | usvg::Paint::RadialGradient(_)
-            | usvg::Paint::Pattern(_) => Color::default(),
+            | usvg::Paint::Pattern(_) => Color::NONE,
         };
 
         let linecap = match self.linecap() {
