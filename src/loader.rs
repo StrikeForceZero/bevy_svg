@@ -4,7 +4,7 @@ use bevy::{
     utils::ConditionalSendFuture
 };
 use thiserror::Error;
-
+use crate::svg;
 use crate::svg::Svg;
 
 #[derive(Default)]
@@ -71,6 +71,8 @@ pub enum SvgError {
     IoError(#[from] std::io::Error),
     #[error("failed to load an SVG: {0}")]
     SvgError(#[from] usvg::Error),
+    #[error("failed to handle SVG Tree: {0}")]
+    TreeError(#[from] svg::TreeError),
 }
 
 /// An error that occurs when loading a texture from a file.

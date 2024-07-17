@@ -15,11 +15,12 @@ use lyon_geom::euclid::default::Transform2D;
 use lyon_path::PathEvent;
 use lyon_tessellation::{math::Point, FillTessellator, StrokeTessellator};
 use svgtypes::ViewBox;
+use thiserror::Error;
 use usvg::{
     tiny_skia_path::{PathSegment, PathSegmentsIter},
 };
 
-use crate::{loader::FileSvgError, render::tessellation, Convert};
+use crate::{loader::FileSvgError, render::tessellation, Convert, resvg};
 
 /// A loaded and deserialized SVG file.
 #[derive(AsBindGroup, Reflect, Debug, Clone, Asset)]
@@ -60,7 +61,7 @@ impl Svg {
     /// Loads an SVG from bytes
     pub fn from_bytes(
         bytes: &[u8],
-        path: impl Into<PathBuf>,
+        path: impl Into<PathBuf> + Copy,
         fonts: Option<impl Into<PathBuf>>,
     ) -> Result<Svg, FileSvgError> {
         let svg_tree =
@@ -75,7 +76,10 @@ impl Svg {
         fontdb.load_system_fonts();
         fontdb.load_fonts_dir(fonts.map(|p| p.into()).unwrap_or("./assets".into()));
 
-        Ok(Svg::from_tree(svg_tree))
+        Svg::from_tree(svg_tree).map_err(|err| FileSvgError {
+            error: err.into(),
+            path: format!("{}", path.into().display()),
+        })
     }
 
     /// Creates a bevy mesh from the SVG data.
@@ -88,14 +92,27 @@ impl Svg {
         buffer.convert()
     }
 
-    pub(crate) fn from_tree(tree: usvg::Tree) -> Svg {
+    pub(crate) fn from_tree(tree: usvg::Tree) -> Result<Svg, TreeError> {
         let view_box = tree.root().layer_bounding_box();
         let size = tree.size();
         let mut descriptors = Vec::new();
         let transform = tree.root().transform();
 
+        // TODO: this might be wrong or unnecessary
+        let Some(max_bbox) = resvg::tiny_skia::IntRect::from_xywh(
+            -(view_box.width().ceil() as i32) * 2,
+            -(view_box.height().ceil() as i32) * 2,
+            view_box.width().ceil().abs() as u32 * 5,
+            view_box.height().ceil().abs() as u32 * 5,
+        ) else {
+            return Err(TreeError::UnderOrOverflow)
+        };
+        
+        let context = resvg::Context { max_bbox };
+
         struct NodeContext<'a> {
             node: &'a usvg::Node,
+            context: resvg::Context,
             transform: usvg::Transform,
         }
 
@@ -105,19 +122,90 @@ impl Svg {
             .into_iter()
             .map(|node| NodeContext {
                 node,
+                context,
                 transform,
             })
             .collect::<VecDeque<_>>();
 
-        while let Some(NodeContext { node, transform }) = node_stack.pop_front() {
+        while let Some(NodeContext { node, context, transform }) = node_stack.pop_front() {
             match node {
                 usvg::Node::Group(ref group) => {
+                    // https://github.com/RazrFalcon/resvg/blob/1a6922d5bfcee9e69e04dc47cb0b586f1ca64a1c/crates/resvg/src/render.rs#L56-L102
+                    // This Source Code Form is subject to the terms of the Mozilla Public
+                    // License, v. 2.0. If a copy of the MPL was not distributed with this
+                    // file, You can obtain one at http://mozilla.org/MPL/2.0/.
                     let transform = transform.pre_concat(group.transform());
-                    for node in group.children() {
-                        node_stack.push_back(NodeContext {
-                            node,
-                            transform,
-                        });
+                    if !group.should_isolate() {
+                        for node in group.children() {
+                            node_stack.push_back(NodeContext {
+                                node,
+                                context,
+                                transform,
+                            });
+                        }
+                    } else {
+                        
+                        let Some(bbox) = group.layer_bounding_box().transform(transform) else {
+                            return Err(TreeError::InvalidTransform);
+                        };
+
+                        let Some(mut ibbox) = (if group.filters().is_empty() {
+                            // Convert group bbox into an integer one, expanding each side outwards by 2px
+                            // to make sure that anti-aliased pixels would not be clipped.
+                            usvg::tiny_skia_path::IntRect::from_xywh(
+                                bbox.x().floor() as i32 - 2,
+                                bbox.y().floor() as i32 - 2,
+                                bbox.width().ceil() as u32 + 4,
+                                bbox.height().ceil() as u32 + 4,
+                            )
+                        } else {
+                            // The bounding box for groups with filters is special and should not be expanded by 2px,
+                            // because it's already acting as a clipping region.
+                            let bbox = bbox.to_int_rect();
+                            // Make sure our filter region is not bigger than 4x the canvas size.
+                            // This is required mainly to prevent huge filter regions that would tank the performance.
+                            // It should not affect the final result in any way.
+                            resvg::geom::fit_to_rect(bbox, context.max_bbox)
+                        }) else { 
+                            return Err(TreeError::InvalidTransform);
+                        };
+
+                        // Make sure our layer is not bigger than 4x the canvas size.
+                        // This is required to prevent huge layers.
+                        if group.filters().is_empty() {
+                            let Some(new_ibbox) = resvg::geom::fit_to_rect(ibbox, context.max_bbox) else {
+                                return Err(TreeError::UnderOrOverflow);
+                            };
+                            ibbox = new_ibbox;
+                        }
+
+                        let shift_ts = {
+                            // Original shift.
+                            let mut dx = bbox.x();
+                            let mut dy = bbox.y();
+
+                            // Account for subpixel positioned layers.
+                            dx -= bbox.x() - ibbox.x() as f32;
+                            dy -= bbox.y() - ibbox.y() as f32;
+
+                            resvg::tiny_skia::Transform::from_translate(-dx, -dy)
+                        };
+                        
+                        // TODO: handle filters
+                        
+                        // TODO: handle clipping
+                        
+                        // TODO: handle mask
+
+                        let transform = shift_ts.pre_concat(transform);
+
+                        for node in group.children() {
+                            node_stack.push_back(NodeContext {
+                                node,
+                                context,
+                                transform,
+                            });
+                        }
                     }
                 }
                 usvg::Node::Text(ref text) => {
@@ -126,6 +214,7 @@ impl Svg {
                     for node in group.children() {
                         node_stack.push_back(NodeContext {
                             node,
+                            context,
                             transform,
                         });
                     }
@@ -182,7 +271,7 @@ impl Svg {
             }
         }
 
-        return Svg {
+        Ok(Svg {
             name: Default::default(),
             size: Vec2::new(size.width(), size.height()),
             view_box: ViewBox {
@@ -193,8 +282,19 @@ impl Svg {
             },
             paths: descriptors,
             mesh: Default::default(),
-        };
+        })
     }
+}
+
+
+#[derive(Error, Debug)]
+pub enum TreeError {
+    #[error("InvalidTransform")]
+    InvalidTransform,
+    #[error("InvalidBoundingBox")]
+    InvalidBoundingBox,
+    #[error("UnderOrOverflow")]
+    UnderOrOverflow,
 }
 
 #[derive(Debug, Clone)]
