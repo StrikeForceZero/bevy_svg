@@ -120,6 +120,16 @@ impl Svg {
                         });
                     }
                 }
+                usvg::Node::Text(ref text) => {
+                    let group = text.flattened();
+                    let transform = transform.pre_concat(group.transform());
+                    for node in group.children() {
+                        node_stack.push_back(NodeContext {
+                            node,
+                            transform,
+                        });
+                    }
+                }
                 usvg::Node::Path(ref path) => {
                     if !path.is_visible() {
                         continue
