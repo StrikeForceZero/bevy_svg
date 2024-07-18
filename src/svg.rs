@@ -10,7 +10,7 @@ use bevy::{
     render::{mesh::Mesh, render_resource::AsBindGroup},
     transform::components::Transform,
 };
-use bevy::log::{debug, trace};
+use bevy::log::{debug, error, info, trace, warn};
 use bevy::math::Rect;
 use copyless::VecHelper;
 use lyon_geom::euclid::default::Transform2D;
@@ -18,7 +18,7 @@ use lyon_path::PathEvent;
 use lyon_tessellation::{math::Point, FillTessellator, StrokeTessellator};
 use svgtypes::ViewBox;
 use thiserror::Error;
-use usvg::{tiny_skia_path::{PathSegment, PathSegmentsIter}};
+use usvg::{Node, tiny_skia_path::{PathSegment, PathSegmentsIter}};
 
 use crate::{loader::FileSvgError, render::tessellation, Convert, resvg};
 
@@ -112,8 +112,37 @@ impl Svg {
 
         let context = resvg::Context { max_bbox };
 
+        #[derive(Debug, Clone)]
+        enum NodeValue<'a> {
+            Owned(Node),
+            Ref(&'a Node)
+        }
+
+        impl NodeValue<'_> {
+            fn id(&self) -> &str {
+                let node = match self {
+                    NodeValue::Owned(n) => n,
+                    NodeValue::Ref(n) => n,
+                };
+                node.id()
+            }
+            fn abs_transform(&self) -> usvg::Transform {
+                let node = match self {
+                    NodeValue::Owned(n) => n,
+                    NodeValue::Ref(n) => n,
+                };
+                node.abs_transform()
+            }
+            fn inner(&self) -> &Node {
+                match self {
+                    NodeValue::Owned(n) => n,
+                    NodeValue::Ref(n) => n,
+                }
+            }
+        }
+
         struct NodeContext<'a> {
-            node: &'a usvg::Node,
+            node: NodeValue<'a>,
             context: resvg::Context,
             transform: usvg::Transform,
         }
@@ -123,27 +152,31 @@ impl Svg {
             .children()
             .into_iter()
             .map(|node| NodeContext {
-                node,
+                node: NodeValue::Ref(node),
                 context,
                 transform,
             })
+            .enumerate()
             .collect::<VecDeque<_>>();
 
-        while let Some(NodeContext { node, context, transform }) = node_stack.pop_front() {
+        let mut counter = node_stack.len();
+        while let Some((ix, NodeContext { node, context, transform })) = node_stack.pop_front() {
             #[derive(Debug)]
             struct TraceInfo<'a> {
                 id: &'a str,
-                node: &'a usvg::Node,
+                node: NodeValue<'a>,
                 transform: usvg::Transform,
                 abs_transform: usvg::Transform,
             }
             trace!("{:#?}", TraceInfo {
                 id: node.id(),
-                node,
+                node: node.clone(),
                 transform,
                 abs_transform: node.abs_transform(),
             });
-            match node {
+            debug!("---");
+            debug!("node: {} @{ix}.{counter}", node.id());
+            match node.inner() {
                 usvg::Node::Group(ref group) => {
                     debug!("group: {}", group.id());
                     // https://github.com/RazrFalcon/resvg/blob/1a6922d5bfcee9e69e04dc47cb0b586f1ca64a1c/crates/resvg/src/render.rs#L56-L102
@@ -152,14 +185,37 @@ impl Svg {
                     // file, You can obtain one at http://mozilla.org/MPL/2.0/.
                     let transform = transform.pre_concat(group.transform());
                     if !group.should_isolate() {
+                        debug!("group: children [");
                         for node in group.children() {
-                            node_stack.push_back(NodeContext {
-                                node,
-                                context,
-                                transform,
-                            });
+                            // this fixes the draw order
+                            if node.id().is_empty() {
+                                debug!("  expanding fake group [");
+                                let Node::Group(group) = node else {
+                                    unreachable!("assumption about invisible groups is wrong");
+                                };
+                                let transform = transform.pre_concat(group.transform());
+                                for node in group.children() {
+                                    debug!("    - node: {} @{counter}", node.id());
+                                    node_stack.push_front((counter, NodeContext {
+                                        node: NodeValue::Owned(node.clone()),
+                                        context,
+                                        transform,
+                                    }));
+                                    counter += 1;
+                                }
+                                debug!("  ]");
+                            } else {
+                                debug!("  - node: {} @{counter}", node.id());
+                                node_stack.push_back((counter, NodeContext {
+                                    node: NodeValue::Owned(node.clone()),
+                                    context,
+                                    transform,
+                                }));
+                            }
                         }
+                        debug!("]");
                     } else {
+                        warn!("not implemented path");
                         let Some(bbox) = group.layer_bounding_box().transform(transform) else {
                             return Err(TreeError::InvalidTransform);
                         };
@@ -215,11 +271,12 @@ impl Svg {
                         let transform = shift_ts.pre_concat(transform);
 
                         for node in group.children() {
-                            node_stack.push_back(NodeContext {
-                                node,
+                            node_stack.push_back((counter, NodeContext {
+                                node: NodeValue::Owned(node.clone()),
                                 context,
                                 transform,
-                            });
+                            }));
+                            counter += 1;
                         }
                     }
                 }
@@ -228,11 +285,12 @@ impl Svg {
                     let group = text.flattened();
                     let transform = transform.pre_concat(group.transform());
                     for node in group.children() {
-                        node_stack.push_back(NodeContext {
-                            node,
+                        node_stack.push_back((counter, NodeContext {
+                            node: NodeValue::Owned(node.clone()),
                             context,
                             transform,
-                        });
+                        }));
+                        counter += 1;
                     }
                 }
                 usvg::Node::Path(ref path) => {
@@ -288,9 +346,24 @@ impl Svg {
                     }
                 }
                 usvg::Node::Image(image) => {
-                    debug!("image: {} - not implemented", image.id());
+                    warn!("image: {} - not implemented", image.id());
                 }
             }
+            node.inner().subroots(|group| {
+                debug!("subroot: group: {}", group.id());
+                let transform = transform.pre_concat(group.transform());
+                debug!("subroot: children [");
+                for node in group.children() {
+                    debug!("  - node: {} @{counter}", node.id());
+                    node_stack.push_back((counter, NodeContext {
+                        node: NodeValue::Owned(node.clone()),
+                        transform,
+                        context,
+                    }));
+                    counter += 1;
+                }
+                debug!("]");
+            })
         }
 
         Ok(Svg {
