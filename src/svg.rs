@@ -183,6 +183,7 @@ impl Svg {
                     // This Source Code Form is subject to the terms of the Mozilla Public
                     // License, v. 2.0. If a copy of the MPL was not distributed with this
                     // file, You can obtain one at http://mozilla.org/MPL/2.0/.
+                    let old_transform = transform;
                     let transform = transform.pre_concat(group.transform());
                     if !group.should_isolate() {
                         debug!("group: children [");
@@ -190,12 +191,19 @@ impl Svg {
                             // this fixes the draw order
                             if node.id().is_empty() {
                                 debug!("  expanding fake group [");
+                                let old_group_transform = group.transform();
                                 let Node::Group(group) = node else {
                                     unreachable!("assumption about invisible groups is wrong");
                                 };
+                                let old_transform = transform;
                                 let transform = transform.pre_concat(group.transform());
                                 for node in group.children() {
                                     debug!("    - node: {} @{counter}", node.id());
+                                    debug!("old_trans: {:?}", old_transform);
+                                    debug!("old_group: {:?}", old_group_transform);
+                                    debug!("group_tra: {:?}", group.transform());
+                                    debug!("transform: {:?}", transform);
+                                    debug!("abs_trans: {:?}", node.abs_transform());
                                     node_stack.push_front((counter, NodeContext {
                                         node: NodeValue::Owned(node.clone()),
                                         context,
@@ -206,6 +214,10 @@ impl Svg {
                                 debug!("  ]");
                             } else {
                                 debug!("  - node: {} @{counter}", node.id());
+                                debug!("old_trans: {:?}", old_transform);
+                                debug!("group_tra: {:?}", group.transform());
+                                debug!("transform: {:?}", transform);
+                                debug!("abs_trans: {:?}", node.abs_transform());
                                 node_stack.push_back((counter, NodeContext {
                                     node: NodeValue::Owned(node.clone()),
                                     context,
