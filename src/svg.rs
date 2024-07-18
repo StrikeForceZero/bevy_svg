@@ -10,15 +10,15 @@ use bevy::{
     render::{mesh::Mesh, render_resource::AsBindGroup},
     transform::components::Transform,
 };
+use bevy::log::{debug, trace};
+use bevy::math::Rect;
 use copyless::VecHelper;
 use lyon_geom::euclid::default::Transform2D;
 use lyon_path::PathEvent;
 use lyon_tessellation::{math::Point, FillTessellator, StrokeTessellator};
 use svgtypes::ViewBox;
 use thiserror::Error;
-use usvg::{
-    tiny_skia_path::{PathSegment, PathSegmentsIter},
-};
+use usvg::{tiny_skia_path::{PathSegment, PathSegmentsIter}};
 
 use crate::{loader::FileSvgError, render::tessellation, Convert, resvg};
 
@@ -74,7 +74,9 @@ impl Svg {
 
         let mut fontdb = usvg::fontdb::Database::default();
         fontdb.load_system_fonts();
-        fontdb.load_fonts_dir(fonts.map(|p| p.into()).unwrap_or("./assets".into()));
+        let font_dir = fonts.map(|p| p.into()).unwrap_or("./assets".into());
+        debug!("loading fonts in {:?}", font_dir);
+        fontdb.load_fonts_dir(font_dir);
 
         Svg::from_tree(svg_tree).map_err(|err| FileSvgError {
             error: err.into(),
@@ -107,7 +109,7 @@ impl Svg {
         ) else {
             return Err(TreeError::UnderOrOverflow)
         };
-        
+
         let context = resvg::Context { max_bbox };
 
         struct NodeContext<'a> {
@@ -128,8 +130,22 @@ impl Svg {
             .collect::<VecDeque<_>>();
 
         while let Some(NodeContext { node, context, transform }) = node_stack.pop_front() {
+            #[derive(Debug)]
+            struct TraceInfo<'a> {
+                id: &'a str,
+                node: &'a usvg::Node,
+                transform: usvg::Transform,
+                abs_transform: usvg::Transform,
+            }
+            trace!("{:#?}", TraceInfo {
+                id: node.id(),
+                node,
+                transform,
+                abs_transform: node.abs_transform(),
+            });
             match node {
                 usvg::Node::Group(ref group) => {
+                    debug!("group: {}", group.id());
                     // https://github.com/RazrFalcon/resvg/blob/1a6922d5bfcee9e69e04dc47cb0b586f1ca64a1c/crates/resvg/src/render.rs#L56-L102
                     // This Source Code Form is subject to the terms of the Mozilla Public
                     // License, v. 2.0. If a copy of the MPL was not distributed with this
@@ -144,7 +160,6 @@ impl Svg {
                             });
                         }
                     } else {
-                        
                         let Some(bbox) = group.layer_bounding_box().transform(transform) else {
                             return Err(TreeError::InvalidTransform);
                         };
@@ -166,7 +181,7 @@ impl Svg {
                             // This is required mainly to prevent huge filter regions that would tank the performance.
                             // It should not affect the final result in any way.
                             resvg::geom::fit_to_rect(bbox, context.max_bbox)
-                        }) else { 
+                        }) else {
                             return Err(TreeError::InvalidTransform);
                         };
 
@@ -190,11 +205,11 @@ impl Svg {
 
                             resvg::tiny_skia::Transform::from_translate(-dx, -dy)
                         };
-                        
+
                         // TODO: handle filters
-                        
+
                         // TODO: handle clipping
-                        
+
                         // TODO: handle mask
 
                         let transform = shift_ts.pre_concat(transform);
@@ -209,6 +224,7 @@ impl Svg {
                     }
                 }
                 usvg::Node::Text(ref text) => {
+                    debug!("text: {}", text.id());
                     let group = text.flattened();
                     let transform = transform.pre_concat(group.transform());
                     for node in group.children() {
@@ -221,8 +237,10 @@ impl Svg {
                 }
                 usvg::Node::Path(ref path) => {
                     if !path.is_visible() {
+                        debug!("path: {} - invisible", path.id());
                         continue
                     }
+                    debug!("path: {}", path.id());
                     let abs_transform = node.abs_transform().convert();
 
                     if let Some(fill) = &path.fill() {
@@ -250,6 +268,7 @@ impl Svg {
                             descriptors.alloc().init(PathDescriptor {
                                 segments: path.convert().collect(),
                                 abs_transform,
+                                transform: transform.convert(),
                                 color,
                                 draw_type: DrawType::Fill,
                             });
@@ -262,12 +281,15 @@ impl Svg {
                         descriptors.alloc().init(PathDescriptor {
                             segments: path.convert().collect(),
                             abs_transform,
+                            transform: transform.convert(),
                             color,
                             draw_type,
                         });
                     }
                 }
-                _ => {}
+                usvg::Node::Image(image) => {
+                    debug!("image: {} - not implemented", image.id());
+                }
             }
         }
 
@@ -301,6 +323,7 @@ pub enum TreeError {
 pub struct PathDescriptor {
     pub segments: Vec<PathEvent>,
     pub abs_transform: Transform,
+    pub transform: Transform,
     pub color: Color,
     pub draw_type: DrawType,
 }
@@ -313,12 +336,13 @@ pub enum DrawType {
 
 // Taken from https://github.com/nical/lyon/blob/74e6b137fea70d71d3b537babae22c6652f8843e/examples/wgpu_svg/src/main.rs
 pub(crate) struct PathConvIter<'iter> {
+    bbox: usvg::Rect,
     iter: PathSegmentsIter<'iter>,
     prev: Point,
     first: Point,
     needs_end: bool,
     deferred: Option<PathEvent>,
-    scale: Transform2D<f32>,
+    scale: Vec2,
 }
 
 impl<'iter> Iterator for PathConvIter<'iter> {
@@ -330,6 +354,7 @@ impl<'iter> Iterator for PathConvIter<'iter> {
         }
         let mut return_event = None;
         let next = self.iter.next();
+
         match next {
             Some(PathSegment::MoveTo(point)) => {
                 if self.needs_end {
@@ -402,7 +427,24 @@ impl<'iter> Iterator for PathConvIter<'iter> {
             }
         }
 
-        return return_event.map(|event| event.transformed(&self.scale));
+        // Calculate the bounding box and center of the path
+        let bbox = self.bbox;
+        let p0 = Vec2::new(bbox.left(), bbox.bottom());
+        let p1 = Vec2::new(bbox.right(), bbox.top());
+        let bbox = Rect::from_corners(p0, p1);
+        let center = bbox.center();
+
+        // Create transformations to translate to the origin, scale, and then translate back
+        let to_origin = lyon_geom::Transform::translation(-center.x, -center.y);
+        let scale = lyon_geom::Transform::scale(self.scale.x, self.scale.y);
+        let back_to_center = lyon_geom::Transform::translation(center.x, center.y);
+
+        return_event.map(|event| {
+            event
+                //.transformed(&to_origin)
+                //.transformed(&scale)
+                //.transformed(&back_to_center)
+        })
     }
 }
 
@@ -423,7 +465,8 @@ impl Convert<Point> for usvg::tiny_skia_path::Point {
 impl Convert<Transform> for usvg::tiny_skia_path::Transform {
     #[inline]
     fn convert(self) -> Transform {
-        Transform::from_matrix(Mat4::from_cols(
+        let flip_y = Mat4::from_scale(bevy::math::Vec3::new(1.0, -1.0, 1.0));
+        Transform::from_matrix(flip_y * Mat4::from_cols(
             [self.sx, self.ky, 0.0, 0.0].into(),
             [self.kx, self.sy, 0.0, 0.0].into(),
             [0.0, 0.0, 1.0, 0.0].into(),
@@ -437,12 +480,13 @@ impl<'iter> Convert<PathConvIter<'iter>> for &'iter usvg::Path {
         // TODO: verify abs_transform is expected
         let (scale_x, scale_y) = self.abs_transform().get_scale();
         return PathConvIter {
+            bbox: self.stroke_bounding_box(),
             iter: self.data().segments(),
             first: Point::new(0.0, 0.0),
             prev: Point::new(0.0, 0.0),
             deferred: None,
             needs_end: false,
-            scale: lyon_geom::Transform::scale(scale_x, scale_y),
+            scale: Vec2::new(scale_x, scale_y),
         };
     }
 }
@@ -470,7 +514,7 @@ impl Convert<(Color, DrawType)> for &usvg::Stroke {
         };
 
         let opt = lyon_tessellation::StrokeOptions::tolerance(0.01)
-            .with_line_width(self.width().get() as f32)
+            .with_line_width(self.width().get())
             .with_line_cap(linecap)
             .with_line_join(linejoin);
 

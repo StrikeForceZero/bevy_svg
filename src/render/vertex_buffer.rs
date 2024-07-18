@@ -58,7 +58,7 @@ impl Convert<Mesh> for VertexBuffers {
         mesh.insert_indices(Indices::U32(self.indices));
 
         // Bevy has a different y-axis origin, so we need to flip that axis
-        flip_mesh_vertically(&mut mesh);
+        // flip_mesh_vertically(&mut mesh);
 
         mesh
     }
