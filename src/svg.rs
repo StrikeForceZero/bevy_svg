@@ -569,9 +569,10 @@ impl Convert<(Color, DrawType)> for &usvg::Stroke {
     fn convert(self) -> (Color, DrawType) {
         let color = match self.paint() {
             usvg::Paint::Color(c) => Color::srgba_u8(c.red, c.green, c.blue, self.opacity().to_u8()),
-            usvg::Paint::LinearGradient(_)
-            | usvg::Paint::RadialGradient(_)
-            | usvg::Paint::Pattern(_) => Color::NONE,
+            // TODO: implement, take average for now
+            usvg::Paint::LinearGradient(g) => crate::util::paint::avg_gradient(g.deref().deref()),
+            usvg::Paint::RadialGradient(g) => crate::util::paint::avg_gradient(g.deref().deref()),
+            usvg::Paint::Pattern(_) => Color::NONE,
         };
 
         let linecap = match self.linecap() {
