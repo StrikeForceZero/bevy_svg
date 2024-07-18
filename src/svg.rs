@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use bevy::{
@@ -8,6 +9,8 @@ use bevy::{
     render::{mesh::Mesh, render_resource::AsBindGroup},
     transform::components::Transform,
 };
+use bevy::log::debug;
+use bevy::math::Rect;
 use copyless::VecHelper;
 use lyon_geom::euclid::default::Transform2D;
 use lyon_path::PathEvent;
@@ -93,8 +96,24 @@ impl Svg {
         let size = tree.size;
         let mut descriptors = Vec::new();
 
-        for node in tree.root.descendants() {
+        let mut nodes = tree.root.descendants().collect::<VecDeque<_>>();
+
+        while let Some(node) = nodes.pop_front() {
             match &*node.borrow() {
+                usvg::NodeKind::Group(ref group) => {
+                    for node in node.children() {
+                        nodes.push_back(node);
+                    }
+                }
+                usvg::NodeKind::Text(ref text) => {
+                    debug!("text: {text:#?}");
+                    let Some(node) = text.flattened.as_ref() else { 
+                        continue;
+                    };
+                    for node in node.children() {
+                        nodes.push_back(node);
+                    }
+                }
                 usvg::NodeKind::Path(ref path) => {
                     let abs_transform = node.abs_transform().convert();
 
@@ -107,7 +126,8 @@ impl Svg {
                         };
 
                         descriptors.alloc().init(PathDescriptor {
-                            segments: path.convert().collect(),
+                            rect: path.data.bounds(),
+                            segments: PathWithTransform::new(path, node.abs_transform()).convert().collect(),
                             abs_transform,
                             color,
                             draw_type: DrawType::Fill,
@@ -118,7 +138,8 @@ impl Svg {
                         let (color, draw_type) = stroke.convert();
 
                         descriptors.alloc().init(PathDescriptor {
-                            segments: path.convert().collect(),
+                            rect: path.data.bounds(),
+                            segments: PathWithTransform::new(path, node.abs_transform()).convert().collect(),
                             abs_transform,
                             color,
                             draw_type,
@@ -146,6 +167,7 @@ impl Svg {
 
 #[derive(Debug, Clone)]
 pub struct PathDescriptor {
+    pub rect: usvg::Rect,
     pub segments: Vec<PathEvent>,
     pub abs_transform: Transform,
     pub color: Color,
@@ -165,7 +187,8 @@ pub(crate) struct PathConvIter<'iter> {
     first: Point,
     needs_end: bool,
     deferred: Option<PathEvent>,
-    scale: Transform2D<f32>,
+    transform: usvg::Transform,
+    rect: usvg::Rect,
 }
 
 impl<'iter> Iterator for PathConvIter<'iter> {
@@ -249,7 +272,37 @@ impl<'iter> Iterator for PathConvIter<'iter> {
             }
         }
 
-        return return_event.map(|event| event.transformed(&self.scale));
+        let rect = self.rect;
+        let p0 = Vec2::new(rect.left(), rect.bottom());
+        let p1 = Vec2::new(rect.right(), rect.top());
+        let rect = Rect::from_corners(p0, p1);
+        let center = rect.center();
+
+        // Create transformations to translate to the origin, scale, and then translate back
+        let to_origin = lyon_geom::Transform::translation(center.x, center.y);
+        let back_to_center = lyon_geom::Transform::translation(-center.x, -center.y);
+
+        let (scale_x, scale_y) = self.transform.get_scale();
+        let scale = lyon_geom::Transform::scale(scale_x, scale_y);
+        let translate = lyon_geom::Transform::translation(self.transform.tx, self.transform.tx);
+        let transform = lyon_geom::Transform::from_array([
+            self.transform.sx,
+            self.transform.kx,
+            self.transform.ky,
+            self.transform.sy,
+            self.transform.tx,
+            self.transform.ty,
+        ]);
+
+        return return_event.map(|event| event
+            //.transformed(&translate)
+            //.transformed(&scale)
+            //.transformed(&transform)
+                                
+            //.transformed(&to_origin)
+            //.transformed(&scale)
+            //.transformed(&back_to_center)
+        );
     }
 }
 
@@ -281,16 +334,33 @@ impl Convert<Transform> for usvg::tiny_skia_path::Transform {
     }
 }
 
-impl<'iter> Convert<PathConvIter<'iter>> for &'iter usvg::Path {
+struct PathWithTransform<'iter> {
+    path: &'iter usvg::Path,
+    transform: usvg::Transform,
+}
+
+impl<'iter> PathWithTransform<'iter> {
+    fn new(
+        path: &'iter usvg::Path,
+        transform: usvg::Transform,
+    ) -> Self {
+        Self {
+            path,
+            transform,
+        }
+    }
+}
+
+impl<'iter> Convert<PathConvIter<'iter>> for PathWithTransform<'iter> {
     fn convert(self) -> PathConvIter<'iter> {
-        let (scale_x, scale_y) = self.transform.get_scale();
         return PathConvIter {
-            iter: self.data.segments(),
+            iter: self.path.data.segments(),
             first: Point::new(0.0, 0.0),
             prev: Point::new(0.0, 0.0),
             deferred: None,
             needs_end: false,
-            scale: lyon_geom::Transform::scale(scale_x, scale_y),
+            transform: self.transform,
+            rect: self.path.data.bounds(),
         };
     }
 }
