@@ -145,6 +145,7 @@ impl Svg {
             node: NodeValue<'a>,
             context: resvg::Context,
             transform: usvg::Transform,
+            child_of_fake_group: Vec<usvg::Transform>,
         }
 
         let mut node_stack = tree
@@ -155,12 +156,13 @@ impl Svg {
                 node: NodeValue::Ref(node),
                 context,
                 transform,
+                child_of_fake_group: vec![],
             })
             .enumerate()
             .collect::<VecDeque<_>>();
 
         let mut counter = node_stack.len();
-        while let Some((ix, NodeContext { node, context, transform })) = node_stack.pop_front() {
+        while let Some((ix, NodeContext { node, context, transform, child_of_fake_group: transforms })) = node_stack.pop_front() {
             #[derive(Debug)]
             struct TraceInfo<'a> {
                 id: &'a str,
@@ -192,7 +194,9 @@ impl Svg {
                             if node.id().is_empty() {
                                 debug!("  expanding fake group [");
                                 let old_group_transform = group.transform();
+                                // TODO: doesnt work with knight
                                 let Node::Group(group) = node else {
+                                    error!("bad state - {node:?}");
                                     unreachable!("assumption about invisible groups is wrong");
                                 };
                                 let old_transform = transform;
@@ -208,6 +212,13 @@ impl Svg {
                                         node: NodeValue::Owned(node.clone()),
                                         context,
                                         transform,
+                                        child_of_fake_group: vec![
+                                            old_transform,
+                                            old_group_transform,
+                                            group.transform(),
+                                            transform,
+                                            node.abs_transform(),
+                                        ],
                                     }));
                                     counter += 1;
                                 }
@@ -222,6 +233,7 @@ impl Svg {
                                     node: NodeValue::Owned(node.clone()),
                                     context,
                                     transform,
+                                    child_of_fake_group: transforms.clone(),
                                 }));
                             }
                         }
@@ -287,6 +299,7 @@ impl Svg {
                                 node: NodeValue::Owned(node.clone()),
                                 context,
                                 transform,
+                                child_of_fake_group: transforms.clone(),
                             }));
                             counter += 1;
                         }
@@ -301,6 +314,7 @@ impl Svg {
                             node: NodeValue::Owned(node.clone()),
                             context,
                             transform,
+                            child_of_fake_group: transforms.clone(),
                         }));
                         counter += 1;
                     }
@@ -311,7 +325,8 @@ impl Svg {
                         continue
                     }
                     debug!("path: {}", path.id());
-                    let abs_transform = node.abs_transform().convert();
+                    let abs_transform = path.abs_transform();
+                    let transform = transform;
 
                     if let Some(fill) = &path.fill() {
                         // from resvg render logic
@@ -335,10 +350,21 @@ impl Svg {
                                 _ => Color::NONE,
                             };
 
+                            for &transform in transforms.iter() {
+                                info!("fill: {transform:?}");
+                                descriptors.alloc().init(PathDescriptor {
+                                    segments: path.convert().collect(),
+                                    abs_transform,
+                                    transform,
+                                    color,
+                                    draw_type: DrawType::Fill,
+                                });
+                            }
+
                             descriptors.alloc().init(PathDescriptor {
                                 segments: path.convert().collect(),
                                 abs_transform,
-                                transform: transform.convert(),
+                                transform,
                                 color,
                                 draw_type: DrawType::Fill,
                             });
@@ -348,10 +374,21 @@ impl Svg {
                     if let Some(stroke) = &path.stroke() {
                         let (color, draw_type) = stroke.convert();
 
+                        for &transform in transforms.iter() {
+                            info!("stroke: {transform:?}");
+                            descriptors.alloc().init(PathDescriptor {
+                                segments: path.convert().collect(),
+                                abs_transform,
+                                transform,
+                                color,
+                                draw_type: draw_type.clone(),
+                            });
+                        }
+
                         descriptors.alloc().init(PathDescriptor {
                             segments: path.convert().collect(),
                             abs_transform,
-                            transform: transform.convert(),
+                            transform,
                             color,
                             draw_type,
                         });
@@ -371,6 +408,7 @@ impl Svg {
                         node: NodeValue::Owned(node.clone()),
                         transform,
                         context,
+                        child_of_fake_group: transforms.clone(),
                     }));
                     counter += 1;
                 }
@@ -407,8 +445,8 @@ pub enum TreeError {
 #[derive(Debug, Clone)]
 pub struct PathDescriptor {
     pub segments: Vec<PathEvent>,
-    pub abs_transform: Transform,
-    pub transform: Transform,
+    pub abs_transform: usvg::Transform,
+    pub transform: usvg::Transform,
     pub color: Color,
     pub draw_type: DrawType,
 }

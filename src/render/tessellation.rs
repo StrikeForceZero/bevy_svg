@@ -3,12 +3,10 @@ use bevy::{
     math::Vec3,
     transform::components::Transform,
 };
+use bevy::log::info;
 use lyon_tessellation::{BuffersBuilder, FillOptions, FillTessellator, StrokeTessellator};
 
-use crate::{
-    render::vertex_buffer::{BufferExt, VertexBuffers, VertexConstructor},
-    svg::{DrawType, Svg},
-};
+use crate::{Convert, render::vertex_buffer::{BufferExt, VertexBuffers, VertexConstructor}, svg::{DrawType, Svg}};
 
 pub(crate) fn generate_buffer(
     svg: &Svg,
@@ -20,24 +18,39 @@ pub(crate) fn generate_buffer(
     let mut buffers = VertexBuffers::new();
 
     let mut color = None;
-    for path in &svg.paths {
+    for mut path in &svg.paths {
         let mut buffer = VertexBuffers::new();
 
         if color.is_none() {
             color = Some(path.color);
         }
 
-        let transform = path.abs_transform;
+        let mut transform = path.abs_transform;
+        let segments = if path.transform != path.abs_transform {
+            info!("fixing transform");
+            transform = path.transform.post_concat(path.abs_transform);
+            // path.segments.iter().map(|s| s.transformed(&lyon_geom::Transform::from_array([
+            //     path.transform.sx,
+            //     path.transform.kx,
+            //     path.transform.ky,
+            //     path.transform.sy,
+            //     path.transform.tx,
+            //     path.transform.ty,
+            // ]))).collect()
+            path.segments.clone()
+        } else {
+            path.segments.clone()
+        };
         match path.draw_type {
             DrawType::Fill => {
                 if let Err(e) = fill_tess.tessellate(
-                    path.segments.clone(),
+                    segments,
                     &FillOptions::tolerance(0.001),
                     &mut BuffersBuilder::new(
                         &mut buffer,
                         VertexConstructor {
                             color: path.color,
-                            transform,
+                            transform: transform.convert(),
                         },
                     ),
                 ) {
@@ -46,13 +59,13 @@ pub(crate) fn generate_buffer(
             }
             DrawType::Stroke(opts) => {
                 if let Err(e) = stroke_tess.tessellate(
-                    path.segments.clone(),
+                    segments,
                     &opts,
                     &mut BuffersBuilder::new(
                         &mut buffer,
                         VertexConstructor {
                             color: path.color,
-                            transform,
+                            transform: transform.convert(),
                         },
                     ),
                 ) {
