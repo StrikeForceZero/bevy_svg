@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use bevy::{
@@ -7,11 +8,12 @@ use bevy::{
     reflect::{std_traits::ReflectDefault, Reflect},
     render::{mesh::Mesh, render_resource::AsBindGroup},
 };
+use bevy::log::trace;
 use copyless::VecHelper;
 use lyon_path::PathEvent;
 use lyon_tessellation::{math::Point, FillTessellator, StrokeTessellator};
 use svgtypes::ViewBox;
-use usvg::{tiny_skia_path::{PathSegment, PathSegmentsIter}, NodeExt, TreeParsing, TreeTextToPath, PaintOrder, Visibility};
+use usvg::{tiny_skia_path::{PathSegment, PathSegmentsIter}, TreeParsing, PaintOrder, Visibility, NodeExt, TreeTextToPath};
 
 use crate::{loader::FileSvgError, render::tessellation, Convert};
 use crate::util::paint::avg_gradient;
@@ -95,9 +97,20 @@ impl Svg {
         let offset = size_center - view_box_center;
         let offset = usvg::Transform::from_translate(offset.x, offset.y);
 
-        for node in tree.root.descendants() {
+        let mut node_stack = tree.root.descendants().collect::<VecDeque<_>>();
+        
+        while let Some(node) = node_stack.pop_front() {
             match &*node.borrow() {
+                usvg::NodeKind::Text(text) => {
+                    trace!("text: {:?}", text.id);
+                    if let Some(node) = &text.flattened {
+                        for node in node.descendants() {
+                            node_stack.push_front(node);
+                        }
+                    }
+                }
                 usvg::NodeKind::Path(ref path) => {
+                    trace!("path: {:?}", path.id);
                     if matches!(path.visibility, Visibility::Hidden | Visibility::Collapse) {
                         continue;
                     }
@@ -107,6 +120,7 @@ impl Svg {
                         abs_transform,
                     };
 
+                    // TODO: doesn't seem to be set in 0.37
                     match path.paint_order {
                         PaintOrder::FillAndStroke => {
                             Self::process_fill(&mut descriptors, path_with_abs_transform);
