@@ -3,22 +3,18 @@ use std::path::PathBuf;
 use bevy::{
     asset::{Asset, Handle},
     color::Color,
-    math::{Mat4, Vec2},
+    math::Vec2,
     reflect::{std_traits::ReflectDefault, Reflect},
     render::{mesh::Mesh, render_resource::AsBindGroup},
-    transform::components::Transform,
 };
 use copyless::VecHelper;
-use lyon_geom::euclid::default::Transform2D;
 use lyon_path::PathEvent;
 use lyon_tessellation::{math::Point, FillTessellator, StrokeTessellator};
 use svgtypes::ViewBox;
-use usvg::{
-    tiny_skia_path::{PathSegment, PathSegmentsIter},
-    NodeExt, TreeParsing, TreeTextToPath,
-};
+use usvg::{tiny_skia_path::{PathSegment, PathSegmentsIter}, NodeExt, TreeParsing, TreeTextToPath, PaintOrder, Visibility};
 
 use crate::{loader::FileSvgError, render::tessellation, Convert};
+use crate::util::paint::avg_gradient;
 
 /// A loaded and deserialized SVG file.
 #[derive(AsBindGroup, Reflect, Debug, Clone, Asset)]
@@ -93,36 +89,33 @@ impl Svg {
         let size = tree.size;
         let mut descriptors = Vec::new();
 
+        // calculate offset for the abs_transform to center svg on its origin
+        let size_center = Vec2::new(size.width(), size.height()) / 2.0;
+        let view_box_center = Vec2::new(view_box.rect.width(), view_box.rect.height()) / 2.0;
+        let offset = size_center - view_box_center;
+        let offset = usvg::Transform::from_translate(offset.x, offset.y);
+
         for node in tree.root.descendants() {
             match &*node.borrow() {
                 usvg::NodeKind::Path(ref path) => {
-                    let abs_transform = node.abs_transform().convert();
-
-                    if let Some(fill) = &path.fill {
-                        let color = match fill.paint {
-                            usvg::Paint::Color(c) => {
-                                Color::srgba_u8(c.red, c.green, c.blue, fill.opacity.to_u8())
-                            }
-                            _ => Color::default(),
-                        };
-
-                        descriptors.alloc().init(PathDescriptor {
-                            segments: path.convert().collect(),
-                            abs_transform,
-                            color,
-                            draw_type: DrawType::Fill,
-                        });
+                    if matches!(path.visibility, Visibility::Hidden | Visibility::Collapse) {
+                        continue;
                     }
+                    let abs_transform = node.abs_transform().post_concat(offset);
+                    let path_with_abs_transform = PathWithAbsTransform {
+                        path,
+                        abs_transform,
+                    };
 
-                    if let Some(stroke) = &path.stroke {
-                        let (color, draw_type) = stroke.convert();
-
-                        descriptors.alloc().init(PathDescriptor {
-                            segments: path.convert().collect(),
-                            abs_transform,
-                            color,
-                            draw_type,
-                        });
+                    match path.paint_order {
+                        PaintOrder::FillAndStroke => {
+                            Self::process_fill(&mut descriptors, path_with_abs_transform);
+                            Self::process_stroke(&mut descriptors, path_with_abs_transform);
+                        }
+                        PaintOrder::StrokeAndFill => {
+                            Self::process_stroke(&mut descriptors, path_with_abs_transform);
+                            Self::process_fill(&mut descriptors, path_with_abs_transform);
+                        }
                     }
                 }
                 _ => {}
@@ -142,12 +135,59 @@ impl Svg {
             mesh: Default::default(),
         };
     }
+
+    fn process_fill(descriptors: &mut Vec<PathDescriptor>, path_with_abs_transform: PathWithAbsTransform) {
+        let path = path_with_abs_transform.path;
+        // from resvg render logic
+        if path.data.bounds().width() == 0.0 || path.data.bounds().height() == 0.0 {
+            // Horizontal and vertical lines cannot be filled. Skip.
+            return
+        }
+        let Some(fill) = &path.fill else {
+            return;
+        };
+        let color = match &fill.paint {
+            usvg::Paint::Color(c) => {
+                Color::srgba_u8(c.red, c.green, c.blue, fill.opacity.to_u8())
+            }
+            usvg::Paint::LinearGradient(g) => {
+                // TODO: implement
+                // just taking the average between the first and last stop so we get something to render
+                avg_gradient(&g.base)
+            }
+            usvg::Paint::RadialGradient(g) => {
+                // TODO: implement
+                // just taking the average between the first and last stop so we get something to render
+                avg_gradient(&g.base)
+            }
+            _ => Color::NONE,
+        };
+
+        descriptors.alloc().init(PathDescriptor {
+            segments: path_with_abs_transform.convert().collect(),
+            color,
+            draw_type: DrawType::Fill,
+        });
+    }
+
+    fn process_stroke(descriptors: &mut Vec<PathDescriptor>, path_with_abs_transform: PathWithAbsTransform) {
+        let path = path_with_abs_transform.path;
+        let Some(stroke) = &path.stroke else {
+            return
+        };
+        let (color, draw_type) = stroke.convert();
+
+        descriptors.alloc().init(PathDescriptor {
+            segments: path_with_abs_transform.convert().collect(),
+            color,
+            draw_type,
+        });
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct PathDescriptor {
     pub segments: Vec<PathEvent>,
-    pub abs_transform: Transform,
     pub color: Color,
     pub draw_type: DrawType,
 }
@@ -158,14 +198,20 @@ pub enum DrawType {
     Stroke(lyon_tessellation::StrokeOptions),
 }
 
+#[derive(Debug, Copy, Clone)]
+struct PathWithAbsTransform<'a> {
+    path: &'a usvg::Path,
+    abs_transform: usvg::Transform,
+}
+
 // Taken from https://github.com/nical/lyon/blob/74e6b137fea70d71d3b537babae22c6652f8843e/examples/wgpu_svg/src/main.rs
 pub(crate) struct PathConvIter<'iter> {
     iter: PathSegmentsIter<'iter>,
+    abs_transform: usvg::Transform,
     prev: Point,
     first: Point,
     needs_end: bool,
     deferred: Option<PathEvent>,
-    scale: Transform2D<f32>,
 }
 
 impl<'iter> Iterator for PathConvIter<'iter> {
@@ -249,7 +295,23 @@ impl<'iter> Iterator for PathConvIter<'iter> {
             }
         }
 
-        return return_event.map(|event| event.transformed(&self.scale));
+        return_event.map(|event| {
+            // Mapping for converting usvg::Transform to lyon_geom::Transform
+            //
+            // | sx  kx  tx | -> | m11 m21 m31 |
+            // | ky  sy  ty | -> | m12 m22 m32 |
+            // |  0   0   1 | -> |   0   0   1 |
+            //
+            // m11, m12,
+            // m21, m22,
+            // m31, m32,
+            event
+                .transformed(&lyon_geom::Transform::new(
+                    self.abs_transform.sx, self.abs_transform.ky,
+                    self.abs_transform.kx, self.abs_transform.sy,
+                    self.abs_transform.tx, self.abs_transform.ty,
+                ))
+        })
     }
 }
 
@@ -267,28 +329,15 @@ impl Convert<Point> for usvg::tiny_skia_path::Point {
     }
 }
 
-impl Convert<Transform> for usvg::tiny_skia_path::Transform {
-    #[inline]
-    fn convert(self) -> Transform {
-        Transform::from_matrix(Mat4::from_cols(
-            [self.sx, self.ky, 0.0, 0.0].into(),
-            [self.kx, self.sy, 0.0, 0.0].into(),
-            [0.0, 0.0, 1.0, 0.0].into(),
-            [self.tx, self.ty, 0.0, 1.0].into(),
-        ))
-    }
-}
-
-impl<'iter> Convert<PathConvIter<'iter>> for &'iter usvg::Path {
+impl<'iter> Convert<PathConvIter<'iter>> for PathWithAbsTransform<'iter> {
     fn convert(self) -> PathConvIter<'iter> {
-        let (scale_x, scale_y) = self.transform.get_scale();
         return PathConvIter {
-            iter: self.data.segments(),
+            iter: self.path.data.segments(),
+            abs_transform: self.abs_transform,
             first: Point::new(0.0, 0.0),
             prev: Point::new(0.0, 0.0),
             deferred: None,
             needs_end: false,
-            scale: lyon_geom::Transform::scale(scale_x, scale_y),
         };
     }
 }
@@ -296,11 +345,11 @@ impl<'iter> Convert<PathConvIter<'iter>> for &'iter usvg::Path {
 impl Convert<(Color, DrawType)> for &usvg::Stroke {
     #[inline]
     fn convert(self) -> (Color, DrawType) {
-        let color = match self.paint {
+        let color = match &self.paint {
             usvg::Paint::Color(c) => Color::srgba_u8(c.red, c.green, c.blue, self.opacity.to_u8()),
-            usvg::Paint::LinearGradient(_)
-            | usvg::Paint::RadialGradient(_)
-            | usvg::Paint::Pattern(_) => Color::default(),
+            usvg::Paint::LinearGradient(g) => avg_gradient(&g.base),
+            usvg::Paint::RadialGradient(g) => avg_gradient(&g.base),
+            usvg::Paint::Pattern(_) => Color::NONE,
         };
 
         let linecap = match self.linecap {

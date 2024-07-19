@@ -11,6 +11,7 @@ use bevy::{
     },
     transform::components::Transform,
 };
+use bevy::render::mesh::VertexAttributeValues;
 use copyless::VecHelper;
 use lyon_tessellation::{
     self, FillVertex, FillVertexConstructor, StrokeVertex, StrokeVertexConstructor,
@@ -32,6 +33,15 @@ pub(crate) type IndexType = u32;
 /// Lyon's [`VertexBuffers`] generic data type defined for [`Vertex`].
 pub(crate) type VertexBuffers = lyon_tessellation::VertexBuffers<Vertex, IndexType>;
 
+fn flip_mesh_vertically(mesh: &mut Mesh) {
+    if let Some(VertexAttributeValues::Float32x3(positions)) = mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION) {
+        for position in positions.iter_mut() {
+            // Invert the y-coordinate to flip the mesh vertically
+            position[1] = -position[1];
+        }
+    }
+}
+
 impl Convert<Mesh> for VertexBuffers {
     fn convert(self) -> Mesh {
         let mut positions = Vec::with_capacity(self.vertices.len());
@@ -47,6 +57,9 @@ impl Convert<Mesh> for VertexBuffers {
         mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
         mesh.insert_indices(Indices::U32(self.indices));
 
+        // Bevy has a different y-axis origin, so we need to flip that axis
+        flip_mesh_vertically(&mut mesh);
+
         mesh
     }
 }
@@ -54,17 +67,15 @@ impl Convert<Mesh> for VertexBuffers {
 /// Zero-sized type used to implement various vertex construction traits from Lyon.
 pub(crate) struct VertexConstructor {
     pub(crate) color: Color,
-    pub(crate) transform: Transform,
 }
 
 /// Enables the construction of a [`Vertex`] when using a `FillTessellator`.
 impl FillVertexConstructor<Vertex> for VertexConstructor {
     fn new_vertex(&mut self, vertex: FillVertex) -> Vertex {
         let vertex = vertex.position();
-        let pos = self.transform * Vec3::new(vertex.x, vertex.y, 0.0);
 
         Vertex {
-            position: [pos.x, pos.y, pos.z],
+            position: [vertex.x, vertex.y, 0.0],
             color: self.color.to_linear().to_f32_array(),
         }
     }
@@ -74,10 +85,9 @@ impl FillVertexConstructor<Vertex> for VertexConstructor {
 impl StrokeVertexConstructor<Vertex> for VertexConstructor {
     fn new_vertex(&mut self, vertex: StrokeVertex) -> Vertex {
         let vertex = vertex.position();
-        let pos = self.transform * Vec3::new(vertex.x, vertex.y, 0.0);
 
         Vertex {
-            position: [pos.x, pos.y, pos.z],
+            position: [vertex.x, vertex.y, 0.0],
             color: self.color.to_linear().to_f32_array(),
         }
     }
