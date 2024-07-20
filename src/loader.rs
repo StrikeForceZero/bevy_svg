@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use bevy::{
     asset::{io::Reader, AssetLoader, AsyncReadExt, LoadContext},
     log::debug,
@@ -5,10 +6,12 @@ use bevy::{
 };
 use thiserror::Error;
 
-use crate::svg::Svg;
+use crate::svg::{Options, Svg};
 
 #[derive(Default)]
-pub struct SvgAssetLoader;
+pub struct SvgAssetLoader {
+    options: Option<Options>,
+}
 
 impl AssetLoader for SvgAssetLoader {
     type Asset = Svg;
@@ -32,7 +35,7 @@ impl AssetLoader for SvgAssetLoader {
                     path: load_context.path().display().to_string(),
                 })?;
 
-            let mut svg = Svg::from_bytes(&bytes, load_context.path(), None::<&std::path::Path>)?;
+            let mut svg = Svg::from_bytes(&bytes, load_context.path(), None::<&std::path::Path>, self.options.clone())?;
             let name = &load_context
                 .path()
                 .file_name()

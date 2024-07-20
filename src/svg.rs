@@ -18,8 +18,137 @@ use usvg::{
     tiny_skia_path::{PathSegment, PathSegmentsIter},
     PaintOrder,
 };
-
+use serde::{Deserialize, Serialize};
 use crate::{loader::FileSvgError, render::tessellation, Convert};
+
+#[derive(Debug, Default, Clone)]
+pub struct Options {
+
+    /// Target DPI.
+    ///
+    /// Impacts units conversion.
+    ///
+    /// Default: 96.0
+    pub dpi: Option<f32>,
+
+    /// A default font family.
+    ///
+    /// Will be used when no `font-family` attribute is set in the SVG.
+    ///
+    /// Default: Times New Roman
+    pub font_family: Option<String>,
+
+    /// A default font size.
+    ///
+    /// Will be used when no `font-size` attribute is set in the SVG.
+    ///
+    /// Default: 12
+    pub font_size: Option<f32>,
+
+    /// A list of languages.
+    ///
+    /// Will be used to resolve a `systemLanguage` conditional attribute.
+    ///
+    /// Format: en, en-US.
+    ///
+    /// Default: `[en]`
+    pub languages: Option<Vec<String>>,
+
+    /// Specifies the default shape rendering method.
+    ///
+    /// Will be used when an SVG element's `shape-rendering` property is set to `auto`.
+    ///
+    /// Default: GeometricPrecision
+    pub shape_rendering: Option<usvg::ShapeRendering>,
+
+    /// Specifies the default text rendering method.
+    ///
+    /// Will be used when an SVG element's `text-rendering` property is set to `auto`.
+    ///
+    /// Default: OptimizeLegibility
+    pub text_rendering: Option<usvg::TextRendering>,
+
+    /// Specifies the default image rendering method.
+    ///
+    /// Will be used when an SVG element's `image-rendering` property is set to `auto`.
+    ///
+    /// Default: OptimizeQuality
+    pub image_rendering: Option<usvg::ImageRendering>,
+
+    /// Default viewport size to assume if there is no `viewBox` attribute and
+    /// the `width` or `height` attributes are relative.
+    ///
+    /// Default: `(100, 100)`
+    pub default_size: Option<usvg::Size>,
+
+    /// A database of fonts usable by text.
+    ///
+    /// This is a base database. If a custom `font_resolver` is specified,
+    /// additional fonts can be loaded during parsing. Those will be added to a
+    /// copy of this database. The full database containing all fonts referenced
+    /// in a `Tree` becomes available as [`Tree::fontdb`](crate::Tree::fontdb)
+    /// after parsing. If no fonts were loaded dynamically, that database will
+    /// be the same as this one.
+    pub fontdb: Option<Arc<usvg::fontdb::Database>>,
+}
+
+
+impl Options {
+    fn build<'a>(self, fonts: Option<impl Into<PathBuf>>) -> usvg::Options<'a> {
+        let fontdb = self.fontdb.unwrap_or_else(|| {
+            let mut fontdb = usvg::fontdb::Database::default();
+            fontdb.load_system_fonts();
+            let font_dir = fonts.map(|p| p.into()).unwrap_or("./assets".into());
+            debug!("loading fonts in {:?}", font_dir);
+            fontdb.load_fonts_dir(font_dir);
+
+            Arc::new(fontdb)
+        });
+
+        let mut options = usvg::Options {
+            fontdb,
+            ..Default::default()
+        };
+        // if let Some(resources_dir) = self.resources_dir {
+        //     options.resources_dir = Some(resources_dir);
+        // }
+        if let Some(dpi) = self.dpi {
+            options.dpi = dpi;
+        }
+        if let Some(font_family) = self.font_family {
+            options.font_family = font_family;
+        }
+        if let Some(font_size) = self.font_size {
+            options.font_size = font_size;
+        }
+        if let Some(languages) = self.languages {
+            options.languages = languages;
+        }
+        if let Some(shape_rendering) = self.shape_rendering {
+            options.shape_rendering = shape_rendering;
+        }
+        if let Some(text_rendering) = self.text_rendering {
+            options.text_rendering = text_rendering;
+        }
+        if let Some(image_rendering) = self.image_rendering {
+            options.image_rendering = image_rendering;
+        }
+        if let Some(default_size) = self.default_size {
+            options.default_size = default_size;
+        }
+        // if let Some(image_href_resolver) = self.image_href_resolver {
+        //     options.image_href_resolver = image_href_resolver;
+        // }
+        // if let Some(font_resolver) = self.font_resolver {
+        //     options.font_resolver = font_resolver;
+        // }
+
+        options
+    }
+}
+
+
+
 
 /// A loaded and deserialized SVG file.
 #[derive(AsBindGroup, Reflect, Debug, Clone, Asset)]
@@ -58,25 +187,15 @@ impl Default for Svg {
 
 impl Svg {
     /// Loads an SVG from bytes
-    pub fn from_bytes(
+    pub fn from_bytes<'a>(
         bytes: &[u8],
         path: impl Into<PathBuf> + Copy,
         fonts: Option<impl Into<PathBuf>>,
+        options: Option<Options>,
     ) -> Result<Svg, FileSvgError> {
-        let mut fontdb = usvg::fontdb::Database::default();
-        fontdb.load_system_fonts();
-        let font_dir = fonts.map(|p| p.into()).unwrap_or("./assets".into());
-        debug!("loading fonts in {:?}", font_dir);
-        fontdb.load_fonts_dir(font_dir);
-
-        let fontdb = Arc::new(fontdb);
-
         let svg_tree = usvg::Tree::from_data(
             &bytes,
-            &usvg::Options {
-                fontdb,
-                ..Default::default()
-            },
+            &options.unwrap_or_default().build(fonts),
         )
         .map_err(|err| FileSvgError {
             error: err.into(),
